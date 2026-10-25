@@ -1,0 +1,99 @@
+name: ci-cd
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # OIDC to AWS (no long-lived keys)
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  PROJECT: iris-ml
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform validate
+        working-directory: terraform
+        run: |
+          terraform fmt -recursive -diff
+          terraform init -backend=false
+          terraform validate
+      - name: Docker build (smoke)
+        run: |
+          docker build -t $PROJECT:ci .
+          docker run -d --name api -p 8000:8000 $PROJECT:ci
+          for i in $(seq 1 15); do curl -sf localhost:8000/health && break || sleep 2; done
+          curl -sf -X POST localhost:8000/predict -H 'content-type: application/json' \
+            -d '{"sepal_length":5.1,"sepal_width":3.5,"petal_length":1.4,"petal_width":0.2}'
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: deploy-prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.PROJECT }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      # Registry must exist before we can push an image to it
+      - name: Ensure ECR exists
+        working-directory: terraform
+        run: terraform apply -auto-approve -target=aws_ecr_repository.app
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push image
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/${{ env.PROJECT }}
+          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest .
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+
+      - name: Terraform apply (rolls out new image)
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="image_tag=${{ github.sha }}" \
+            -var="alert_email=${{ vars.ALERT_EMAIL }}"
+
+      - name: Wait for stable service
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.PROJECT }}-cluster --services ${{ env.PROJECT }}-svc
+
+      - name: Smoke test
+        working-directory: terraform
+        run: |
+          URL=http://$(terraform output -raw alb_dns_name)
+          curl -sf --retry 10 --retry-delay 6 --retry-all-errors $URL/health
+          curl -sf -X POST $URL/predict -H 'content-type: application/json' \
+            -d '{"sepal_length":6.7,"sepal_width":3.0,"petal_length":5.2,"petal_width":2.3}'
